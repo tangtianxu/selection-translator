@@ -1,0 +1,4 @@
+matplotlib>=3.8
+Pillow>=10.0
+pystray>=0.19
+
