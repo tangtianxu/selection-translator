@@ -52,6 +52,8 @@ VK_C = 0x43
 KEYEVENTF_KEYUP = 0x0002
 MAX_TEXT_LENGTH = 5000
 MAX_HISTORY_ITEMS = 200
+MIN_FONT_SIZE = 8
+MAX_FONT_SIZE = 18
 GMEM_MOVEABLE = 0x0002
 SAFE_STANDARD_CLIPBOARD_FORMATS = {1, 7, 8, 13, 15, 16, 17}
 SAFE_REGISTERED_CLIPBOARD_FORMATS = {
@@ -407,7 +409,14 @@ class SelectionTranslator:
         self.root.minsize(540, 390)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
         self.root.report_callback_exception = self._report_callback_exception
-        self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
+        try:
+            saved_font_size = int(self.settings.get("font_size", 10))
+        except (TypeError, ValueError):
+            saved_font_size = 10
+        saved_font_size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, saved_font_size))
+        self.font_size = tk.IntVar(value=saved_font_size)
+        self.content_font = ("Microsoft YaHei UI", saved_font_size)
+        self.root.option_add("*Font", self.content_font)
 
         self.target_name = tk.StringVar(value=self.settings.get("target", "简体中文"))
         self.hotkey_name = tk.StringVar(value=self.settings.get("hotkey", "Ctrl+Shift+T"))
@@ -439,7 +448,13 @@ class SelectionTranslator:
         style = ttk.Style(self.root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
+        self.ui_style = style
         style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure(
+            "History.Treeview",
+            font=self.content_font,
+            rowheight=max(22, int(self.font_size.get() * 2.3)),
+        )
 
         self.shell = ttk.Panedwindow(self.root, orient="horizontal")
         self.shell.pack(fill="both", expand=True)
@@ -514,6 +529,7 @@ class SelectionTranslator:
             padx=10,
             pady=8,
             undo=True,
+            font=self.content_font,
         )
         self.source.grid(row=2, column=0, sticky="nsew", pady=(5, 10))
         self.source.bind("<Control-Return>", lambda _event: self.translate())
@@ -539,22 +555,32 @@ class SelectionTranslator:
         translation_header.grid(row=4, column=0, sticky="ew")
         translation_header.columnconfigure(0, weight=1)
         ttk.Label(translation_header, text="译文").grid(row=0, column=0, sticky="w")
+        ttk.Label(translation_header, text="字号：").grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.font_size_box = ttk.Combobox(
+            translation_header,
+            textvariable=self.font_size,
+            values=tuple(range(MIN_FONT_SIZE, MAX_FONT_SIZE + 1)),
+            width=3,
+            state="readonly",
+        )
+        self.font_size_box.grid(row=0, column=2, sticky="e")
+        self.font_size_box.bind("<<ComboboxSelected>>", self._font_size_changed)
         ttk.Checkbutton(
             translation_header,
             text="自动公式",
             variable=self.auto_math_render,
             command=self._auto_math_changed,
-        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
         self.formula_button_text = tk.StringVar(value="公式转换 ▶")
         ttk.Button(translation_header, textvariable=self.formula_button_text, command=self.show_formula_preview).grid(
-            row=0, column=2, sticky="e", padx=(8, 0)
+            row=0, column=4, sticky="e", padx=(8, 0)
         )
         ttk.Checkbutton(
             translation_header,
             text="仅译文",
             variable=self.translation_only,
             command=self._translation_only_changed,
-        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=5, sticky="e", padx=(8, 0))
         self.output = tk.Text(
             frame,
             height=7,
@@ -564,6 +590,7 @@ class SelectionTranslator:
             padx=10,
             pady=8,
             background="#fbfcff",
+            font=self.content_font,
         )
         self.output.grid(row=5, column=0, sticky="nsew", pady=(5, 10))
         self.output.configure(state="disabled")
@@ -624,6 +651,40 @@ class SelectionTranslator:
                 self.status.set("已开启自动公式：检测到 LaTeX 时直接在译文区域渲染")
         else:
             self.status.set("已关闭自动公式；可点击“公式转换”按需查看")
+
+    def _font_size_changed(self, _event=None) -> None:
+        try:
+            size = int(self.font_size.get())
+        except (TypeError, ValueError, tk.TclError):
+            size = 10
+        size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, size))
+        self.font_size.set(size)
+        self.content_font = ("Microsoft YaHei UI", size)
+        for name in (
+            "source",
+            "output",
+            "formula_preview",
+            "history_source_preview",
+            "history_translation_preview",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None and widget.winfo_exists():
+                widget.configure(font=self.content_font)
+        self.ui_style.configure(
+            "History.Treeview",
+            font=self.content_font,
+            rowheight=max(22, int(size * 2.3)),
+        )
+        if self.current_translation_text and self.auto_math_render.get():
+            self._set_output(self.current_translation_text)
+        if self.formula_panel_visible:
+            self._render_document(self.formula_preview, self.current_translation_text, self.formula_images)
+        if self.history_panel_visible:
+            item = self._selected_history_record()
+            if item:
+                self._set_history_preview(item.get("source", ""), item.get("translation", ""))
+        self._save_settings()
+        self.status.set(f"内容字号已调整为 {size}")
 
     def _apply_display_mode(self, initial: bool = False) -> None:
         only_translation = self.translation_only.get()
@@ -949,10 +1010,10 @@ class SelectionTranslator:
     def _has_math(text: str) -> bool:
         return any(is_math for is_math, _content, _display in split_math_segments(text))
 
-    @staticmethod
-    def _formula_image(body: str) -> ImageTk.PhotoImage:
+    def _formula_image(self, body: str) -> ImageTk.PhotoImage:
         buffer = BytesIO()
-        math_to_image(f"${body}$", buffer, dpi=105, format="png", color="#111827")
+        formula_dpi = max(72, round(105 * self.font_size.get() / 10))
+        math_to_image(f"${body}$", buffer, dpi=formula_dpi, format="png", color="#111827")
         buffer.seek(0)
         image = Image.open(buffer).convert("RGBA")
         if image.width <= 1 or image.height <= 1:
@@ -1173,6 +1234,7 @@ class SelectionTranslator:
             background="#fbfcff",
             relief="solid",
             borderwidth=1,
+            font=self.content_font,
         )
         scrollbar = ttk.Scrollbar(preview_frame, orient="vertical", command=self.formula_preview.yview)
         self.formula_preview.configure(yscrollcommand=scrollbar.set)
@@ -1264,6 +1326,7 @@ class SelectionTranslator:
             columns=("source", "translation"),
             show="headings",
             selectmode="browse",
+            style="History.Treeview",
         )
         self.history_tree.heading("source", text="原文")
         self.history_tree.heading("translation", text="翻译结果")
@@ -1283,9 +1346,16 @@ class SelectionTranslator:
         preview.grid(row=3, column=0, sticky="nsew")
         source_box = ttk.Labelframe(preview, text="原文", padding=5)
         translation_box = ttk.Labelframe(preview, text="译文", padding=5)
-        self.history_source_preview = tk.Text(source_box, wrap="word", height=7, state="disabled")
+        self.history_source_preview = tk.Text(
+            source_box, wrap="word", height=7, state="disabled", font=self.content_font
+        )
         self.history_translation_preview = tk.Text(
-            translation_box, wrap="word", height=7, state="disabled", background="#fbfcff"
+            translation_box,
+            wrap="word",
+            height=7,
+            state="disabled",
+            background="#fbfcff",
+            font=self.content_font,
         )
         self.history_source_preview.pack(fill="both", expand=True)
         self.history_translation_preview.pack(fill="both", expand=True)
@@ -1484,6 +1554,7 @@ class SelectionTranslator:
             "source_collapsed": self.source_collapsed.get(),
             "translation_only": self.translation_only.get(),
             "auto_math_render": self.auto_math_render.get(),
+            "font_size": self.font_size.get(),
         }
         try:
             app_data_path().write_text(json.dumps(settings, ensure_ascii=False), encoding="utf-8")
