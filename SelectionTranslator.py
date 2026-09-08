@@ -71,6 +71,10 @@ MATH_PATTERN = re.compile(
     r"(\\begin\{[^{}]+\}.*?\\end\{[^{}]+\}|\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)|(?<!\$)\$(?!\$)[^$\n]+?\$)",
     re.DOTALL,
 )
+MATH_FONT_SHORTHAND_PATTERN = re.compile(
+    r"\\(?P<command>mathbf|mathcal|mathrm|mathit|mathsf|mathtt|mathbb|mathfrak|mathscr)"
+    r"\s+(?P<argument>\\[A-Za-z]+|[A-Za-z0-9])"
+)
 
 LANGUAGES = {
     "简体中文": "zh-CN",
@@ -233,6 +237,15 @@ def normalize_latex_text(text: str) -> str:
     )
 
 
+def normalize_math_body_for_renderer(body: str) -> str:
+    """Adapt valid TeX shorthand to the stricter local MathText parser."""
+    normalized = body.replace(r"\_", "_")
+    return MATH_FONT_SHORTHAND_PATTERN.sub(
+        lambda match: f"\\{match.group('command')}{{{match.group('argument')}}}",
+        normalized,
+    ).strip()
+
+
 def split_math_segments(text: str) -> list[tuple[bool, str, bool]]:
     """Return (is_math, content, is_display) segments."""
     normalized = normalize_latex_text(text)
@@ -251,9 +264,9 @@ def split_math_segments(text: str) -> list[tuple[bool, str, bool]]:
             body = raw[2:-2]
         else:
             body = raw
-        # Escaped underscores are common in Markdown copies of LaTeX but mean
-        # subscripts in the academic text this utility targets.
-        body = body.replace(r"\_", "_").strip()
+        # Markdown copies often escape subscripts, while MathText also requires
+        # braces around font commands that full TeX accepts as shorthand.
+        body = normalize_math_body_for_renderer(body)
         segments.append((True, body, display))
         position = match.end()
     if position < len(normalized):

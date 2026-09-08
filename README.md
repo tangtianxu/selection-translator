@@ -45,7 +45,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name "划词翻
 
 ## 公式支持
 
-公式完全在本地渲染。常见的上下标、分式、根式、求和、积分、极限、希腊字母和概率表达式可直接显示。矩阵、分段函数和多行对齐等完整 LaTeX 环境可能保留为红色源码。
+公式完全在本地渲染。程序会在显示前自动兼容 Markdown 转义的下划线，以及 `\mathbf c`、`\mathcal C`、`\mathsf T` 等未加大括号的常见 TeX 简写，但不会改动复制内容和历史记录。常见的上下标、分式、根式、求和、积分、极限、希腊字母和概率表达式可直接显示。矩阵、分段函数和多行对齐等完整 LaTeX 环境可能保留为红色源码。
 
 ## 隐私与限制
 
@@ -57,4 +57,3 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name "划词翻
 ## 许可证
 
 [MIT License](LICENSE)
-
