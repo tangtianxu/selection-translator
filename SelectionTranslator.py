@@ -68,7 +68,10 @@ SAFE_REGISTERED_CLIPBOARD_FORMATS = {
 }
 
 MATH_PATTERN = re.compile(
-    r"(\\begin\{[^{}]+\}.*?\\end\{[^{}]+\}|\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)|(?<!\$)\$(?!\$)[^$\n]+?\$)",
+    r"(\\begin\{[^{}]+\}.*?\\end\{[^{}]+\}|\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)|"
+    r"(?<!\$)\$(?!\$)[^$\n]+?\$|"
+    r"(?<!\\)\((?=(?:[^()\n]|\([^()\n]*\))*?(?:\\[A-Za-z]+|\\_|[_^]))"
+    r"(?:[^()\n]|\([^()\n]*\))+\)|(?<!\\)\([A-Za-z]\))",
     re.DOTALL,
 )
 MATH_FONT_SHORTHAND_PATTERN = re.compile(
@@ -262,6 +265,8 @@ def split_math_segments(text: str) -> list[tuple[bool, str, bool]]:
             body = raw[1:-1]
         elif raw.startswith(r"\(") or raw.startswith(r"\["):
             body = raw[2:-2]
+        elif raw.startswith("("):
+            body = raw[1:-1]
         else:
             body = raw
         # Markdown copies often escape subscripts, while MathText also requires
