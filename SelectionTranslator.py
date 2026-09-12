@@ -52,6 +52,10 @@ VK_C = 0x43
 KEYEVENTF_KEYUP = 0x0002
 MAX_TEXT_LENGTH = 5000
 MAX_HISTORY_ITEMS = 200
+TRANSLATION_CACHE_SIZE = 200
+API_MIN_INTERVAL_SECONDS = 0.8
+API_429_RETRY_DELAYS = (2.0, 5.0)
+RATE_LIMIT_COOLDOWN_SECONDS = 60.0
 MIN_FONT_SIZE = 8
 MAX_FONT_SIZE = 18
 GMEM_MOVEABLE = 0x0002
@@ -372,6 +376,19 @@ def translate_google(text: str, target: str) -> tuple[str, str]:
     return translated, detected
 
 
+def contains_predominantly_chinese(text: str) -> bool:
+    """Choose the mutual-translation direction locally to avoid a probe request."""
+    chinese = sum("\u3400" <= char <= "\u9fff" for char in text)
+    latin = sum(char.isascii() and char.isalpha() for char in text)
+    return chinese > 0 and chinese / max(1, chinese + latin) >= 0.35
+
+
+class TranslationCooldownError(RuntimeError):
+    def __init__(self, remaining_seconds: float) -> None:
+        self.remaining_seconds = remaining_seconds
+        super().__init__(f"rate limit cooldown: {remaining_seconds:.1f}s")
+
+
 class SelectionTranslator:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -380,6 +397,11 @@ class SelectionTranslator:
         self.hotkey_events: queue.Queue[tuple[int, str]] = queue.Queue()
         self.tray_events: queue.Queue[str] = queue.Queue()
         self.request_id = 0
+        self.translation_request_lock = threading.Lock()
+        self.translation_cache_lock = threading.Lock()
+        self.translation_cache: dict[tuple[str, str, bool], tuple[str, str]] = {}
+        self.last_api_request_time = 0.0
+        self.rate_limited_until = 0.0
         self.copy_sequence = 0
         self.selection_copy_in_progress = False
         self.pending_clipboard_backup: ClipboardBackup | None = None
@@ -1076,23 +1098,53 @@ class SelectionTranslator:
     ) -> None:
         try:
             protected_text, protected_formulas = protect_math_for_translation(text)
-            if mutual:
-                english_result, detected = translate_google(protected_text, "en")
-                if detected.lower().startswith("zh"):
-                    translated = english_result
-                    direction = "中文 → 英文"
-                else:
-                    translated, detected = translate_google(protected_text, "zh-CN")
-                    direction = "英文 → 中文" if detected.lower().startswith("en") else f"{detected} → 中文"
-                detected_label = f"{detected}｜{direction}"
+            request_target = "en" if mutual and contains_predominantly_chinese(text) else (
+                "zh-CN" if mutual else target
+            )
+            cache_key = (text, request_target, mutual)
+            with self.translation_cache_lock:
+                cached = self.translation_cache.get(cache_key)
+            cache_note = ""
+            if cached is not None:
+                translated, detected_label = cached
+                cache_note = "；使用本地缓存"
             else:
-                translated, detected = translate_google(protected_text, target)
-                detected_label = detected
-            translated = restore_protected_math(translated, protected_formulas)
-            self.results.put((request_id, "ok", translated, detected_label, text, completion_note))
+                with self.translation_request_lock:
+                    # Recheck after waiting: an earlier queued request may have populated the cache.
+                    with self.translation_cache_lock:
+                        cached = self.translation_cache.get(cache_key)
+                    if cached is not None:
+                        translated, detected_label = cached
+                        cache_note = "；使用本地缓存"
+                    else:
+                        translated, detected = self._translate_google_with_backoff(protected_text, request_target)
+                        translated = restore_protected_math(translated, protected_formulas)
+                        if mutual and request_target == "en":
+                            direction = "中文 → 英文"
+                        elif mutual:
+                            direction = "英文 → 中文" if detected.lower().startswith("en") else f"{detected} → 中文"
+                        else:
+                            direction = target
+                        detected_label = f"{detected}｜{direction}" if mutual else detected
+                        with self.translation_cache_lock:
+                            if len(self.translation_cache) >= TRANSLATION_CACHE_SIZE:
+                                self.translation_cache.pop(next(iter(self.translation_cache)))
+                            self.translation_cache[cache_key] = (translated, detected_label)
+            self.results.put(
+                (request_id, "ok", translated, detected_label, text, completion_note + cache_note)
+            )
+        except TranslationCooldownError as exc:
+            remaining = max(1, round(exc.remaining_seconds))
+            self.results.put(
+                (request_id, "error", f"Google 免费接口限流冷却中；请约 {remaining} 秒后再试", "", text, completion_note)
+            )
         except urllib.error.HTTPError as exc:
             LOGGER.warning("Google translation HTTP error: %s", exc.code)
-            self.results.put((request_id, "error", f"翻译服务返回错误：HTTP {exc.code}", "", text, completion_note))
+            if exc.code == 429:
+                message = "Google 免费接口仍在限流（HTTP 429）；请稍后重试、切换网络或改用官方 API"
+            else:
+                message = f"翻译服务返回错误：HTTP {exc.code}"
+            self.results.put((request_id, "error", message, "", text, completion_note))
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
             LOGGER.warning("Google translation network error: %s", reason)
@@ -1100,6 +1152,34 @@ class SelectionTranslator:
         except Exception as exc:  # keep the UI alive on malformed service responses
             LOGGER.exception("Translation worker failed")
             self.results.put((request_id, "error", f"翻译失败：{exc}", "", text, completion_note))
+
+    def _translate_google_with_backoff(self, text: str, target: str) -> tuple[str, str]:
+        cooldown_remaining = self.rate_limited_until - time.monotonic()
+        if cooldown_remaining > 0:
+            raise TranslationCooldownError(cooldown_remaining)
+        for attempt in range(len(API_429_RETRY_DELAYS) + 1):
+            interval_wait = API_MIN_INTERVAL_SECONDS - (time.monotonic() - self.last_api_request_time)
+            if interval_wait > 0:
+                time.sleep(interval_wait)
+            self.last_api_request_time = time.monotonic()
+            try:
+                result = translate_google(text, target)
+                self.rate_limited_until = 0.0
+                return result
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429 or attempt >= len(API_429_RETRY_DELAYS):
+                    if exc.code == 429:
+                        self.rate_limited_until = time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
+                    raise
+                fallback_delay = API_429_RETRY_DELAYS[attempt]
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else fallback_delay
+                except (TypeError, ValueError):
+                    delay = fallback_delay
+                delay = max(fallback_delay, min(delay, 15.0))
+                LOGGER.warning("Google rate limited request; retrying in %.1f seconds", delay)
+                time.sleep(delay)
 
     def _poll_results(self) -> None:
         try:
